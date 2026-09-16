@@ -75,10 +75,8 @@ else
 fi
 
 usage_and_exit() {
-
-    # kali 官网的 202x.x iso 安装后，apt 源是 rolling
-    # 因此 netboot last-snapshot 没有意义
-    # 因此这里不显示 last-snapshot|rolling
+    # kali 官网的 202x.x iso 安装后，apt 源是 kali-rolling
+    # 微软商店的 wsl kali，apt 源是 kali-last-snapshot
     cat <<EOF
 Usage: $reinstall_____ anolis      7|8|23
                        opencloudos 8|9|23
@@ -94,8 +92,8 @@ Usage: $reinstall_____ anolis      7|8|23
                        opensuse    16.0|tumbleweed
                        openeuler   20.03|22.03|24.03
                        alpine      3.21|3.22|3.23|3.24
+                       kali        last-snapshot|rolling
                        ubuntu      18.04|20.04|22.04|24.04|26.04 [--minimal]
-                       kali
                        arch
                        gentoo
                        aosc
@@ -117,10 +115,11 @@ Usage: $reinstall_____ anolis      7|8|23
                        For Windows Only:
                        [--allow-ping]
                        [--rdp-port    PORT]
-                       [--add-driver  INF_OR_DIR]
+                       [--add-driver  INF_OR_DIR]  (only for iso installation)
+                       [--no-auto-drivers]         (only for iso installation)
 
                        For Linux Only:
-                       [--no-cloud-kernel]  (Debian/Ubuntu/Alpine)
+                       [--no-cloud-kernel]         (only for Debian/Ubuntu/Alpine)
 
        Manual:         https://github.com/bin456789/reinstall
 
@@ -724,6 +723,7 @@ is_cpu_supports_x86_64_v3() {
     # /proc/cpuinfo 不显示 lzcnt, 可用 abm 代替，但 cygwin 也不显示 abm
     # /proc/cpuinfo 不显示 osxsave, 故用 xsave 代替
 
+    # 在 32 位 cygwin 上也能正常识别
     need_flags="avx avx2 bmi1 bmi2 f16c fma movbe xsave"
     had_flags=$(grep -m 1 ^flags /proc/cpuinfo | awk -F': ' '{print $2}')
 
@@ -1771,7 +1771,7 @@ Continue?
                     info "get direct link"
                     local iso_name=${iso##*\?}
                     local direct_link
-                    if direct_link=$(curl -L "https://delivery-api.ntriver.org/generate-link?filename=$iso_name" |
+                    if direct_link=$(curl -L "https://ntriver.org/api/drive/generate-link?filename=$iso_name" |
                         grep -oE '"url":"[^"]+"' | cut -d: -f2- | tr -d '"' | grep .); then
                         echo "Direct link: $direct_link" >&2
                         iso="$direct_link"
@@ -3537,7 +3537,7 @@ build_extra_cmdline() {
     # 会将 extra.xxx=yyy 写入新系统的 /etc/modprobe.d/local.conf
     # https://answers.launchpad.net/ubuntu/+question/249456
     # https://salsa.debian.org/installer-team/rootskel/-/blob/master/src/lib/debian-installer-startup.d/S02module-params?ref_type=heads
-    for key in confhome hold force_boot_mode force_cn force_old_windows_setup cloud_image no_cloud_kernel main_disk \
+    for key in confhome hold force_boot_mode force_cn force_old_windows_setup cloud_image no_cloud_kernel no_auto_drivers main_disk \
         elts deb_mirror \
         username ssh_port rdp_port web_port web_path allow_ping; do
         value=${!key}
@@ -3585,6 +3585,7 @@ build_nextos_cmdline() {
     if [ $nextos_distro = alpine ]; then
         nextos_cmdline="alpine_repo=$nextos_repo modloop=$nextos_modloop"
     elif is_distro_like_debian $nextos_distro; then
+        # 我们直接强制 di 优先显示到 串口，因此不需要设置分辨率
         # 设置分辨率为800*600，防止分辨率过高 ssh screen attach 后无法全部显示
         # iso 默认有 vga=788
         # 如果要设置位数: video=800x600-16
@@ -3610,12 +3611,10 @@ build_nextos_cmdline() {
 
     if is_distro_like_debian $nextos_distro; then
         if [ "$basearch" = "x86_64" ]; then
-            # debian installer 好像第一个 tty 是主 tty
-            # 设置ttyS0,tty0,安装界面还是显示在ttyS0
             :
         else
             # debian arm 在没有ttyAMA0的机器上（aws t4g），最少要设置一个tty才能启动
-            # 只设置tty0也行，但安装过程ttyS0没有显示
+            # 只设置tty0也行
             nextos_cmdline+=" $(echo_tmp_ttys)"
         fi
     else
@@ -3659,6 +3658,57 @@ mkdir_clear() {
     mkdir -p "$dir"
 }
 
+mod_inittab_for_screen() {
+    # 如果串口不可写
+    # true >/dev/ttyS0 正常
+    # echo >/dev/ttyS0 报 IO 错误
+
+    # /etc/inittab
+    # 主 tty 条目由 /usr/sbin/reopen-console 写入
+    # ttyAMA0::respawn:/sbin/debian-installer
+
+    # 我们补充其它 tty 条目，让他们显示 screen 会话
+    # tty1::respawn:screen -x root/ -p 1
+
+    # 这里用 tty1
+    # 因为直接用 netinst.iso 启动，/etc/inittab 自动创建的是 tty1 而不是 tty0
+    for tty in tty1 ttyS0 ttyAMA0; do
+        # 防止同时存在 tty0 tty1
+        if { [ "$tty" = tty0 ] || [ "$tty" = tty1 ]; } && grep -q "^tty[01]:" /etc/inittab; then
+            continue
+        fi
+        # debian 9-11 没有 stty
+        if ! grep -q "^$tty:" /etc/inittab &&
+            [ -c "/dev/$tty" ] &&
+            { stty -g -F "/dev/$tty" >/dev/null || echo >"/dev/$tty"; } 2>/dev/null; then
+            echo "$tty::respawn:screen -x root/ -p 1" >>/etc/inittab
+        fi
+    done
+}
+
+# 通过优先使用串口，强制 di 使用小分辨率
+# 防止 tty0 分辨率过大，内容同步到 ttyS0/ttyAMA0 后显示异常/乱码
+force_serial_if_exists() {
+    # 低版本环境没有 awk，改用 cut
+
+    # 优先使用有 C 标识的 tty
+    c_tty=$(cat /proc/consoles | grep -F '(EC' | cut -d' ' -f1)
+    if ! { [ "$c_tty" = ttyAMA0 ] || [ "$c_tty" = ttyS0 ]; }; then
+        # 如果不是串口，则忽略
+        c_tty=
+    fi
+
+    for tty in $c_tty ttyAMA0 ttyS0; do
+        # shellcheck disable=SC2034
+        if [ -c "/dev/$tty" ] &&
+            { stty -g -F "/dev/$tty" >/dev/null || echo >"/dev/$tty"; } 2>/dev/null; then
+            consoles=$tty
+            preferred=$tty
+            break
+        fi
+    done
+}
+
 mod_initrd_debian_kali() {
     # hack 1
     # 允许设置 ipv4 onlink 网关
@@ -3671,6 +3721,28 @@ mod_initrd_debian_kali() {
         echo 'if false && : \' | insert_into_file lib/debian-installer.d/S70menu before 'if [ -x "$bterm" ]' -F
         echo 'if true  || : \' | insert_into_file lib/debian-installer.d/S70menu before 'if [ -x "$screen_bin" -a' -F
     }
+    # debian 9 不在 reopen-console 处理 inittab
+    # 暂时不管
+    # shellcheck disable=SC2016
+    if ! { [ "$distro" = debian ] && [ "$releasever" -le 9 ]; }; then
+        get_function_content mod_inittab_for_screen | insert_into_file sbin/reopen-console before 'kill -HUP 1' -F
+
+        # 如果主 tty 是 tty0，S40term-linux 会开启 utf-8，通过 screen 显示在甲骨文云控制台时会出现乱码
+        # 如果主 tty 是 ttyS0 ，S40term-linux 不会开启 utf-8
+        # https://salsa.debian.org/installer-team/rootskel/-/blob/master/src/usr/lib/debian-installer.d/S40term-linux?ref_type=heads
+
+        # 可用以下方法强制 di 显示在 ttyS0，但 /proc/consoles 还是 tty0，S40term-linux 还是会打开 utf-8
+        # 因此还要设置 S40term-linux 或者通过 cmdline 强制 console=ttyS0
+        get_function_content force_serial_if_exists | insert_into_file sbin/reopen-console before 'if [ $PRESEEDING = 1 ]; then' -F
+
+        # 在甲骨文 arm 上设置 console=tty0 console=ttyAMA0 console=ttyS0
+        # 预期 ttyS0 不存在，会把倒数第二个 tty设为主 tty，但实际上主 tty 是 tty0
+        # cat /proc/consoles 可查看哪个是主 tty，有 C 标识的就是主 tty
+
+        # 因此在这里强制 S40term-linux 不使用 utf-8
+        # shellcheck disable=SC1003
+        echo 'if false && : \' | insert_into_file lib/debian-installer.d/S40term-linux before 'if [ -d /usr/lib/locale/C.UTF-8 ]; then' -F
+    fi
 
     # hack 3
     # 修改 /var/lib/dpkg/info/netcfg.postinst 运行我们的脚本
@@ -3878,14 +3950,23 @@ EOF
     # 还原 kali netinst.iso 的 simple-cdd 机制
     # 主要用于调用 kali.postinst 设置 zsh 为默认 shell
     # 但 mini.iso 又没有这种机制
-    # https://gitlab.com/kalilinux/build-scripts/kali-live/-/raw/main/kali-config/common/includes.installer/kali-finish-install?ref_type=heads
+    # https://gitlab.com/kalilinux/build-scripts/kali-installer/-/raw/main/simple-cdd/profiles/kali.postinst?ref_type=heads
     # https://salsa.debian.org/debian/simple-cdd/-/blob/master/debian/14simple-cdd?ref_type=heads
     # https://http.kali.org/pool/main/s/simple-cdd/simple-cdd-profiles_0.6.9_all.udeb
     if [ "$distro" = kali ]; then
         # 但我们没有使用 iso，因此没有 kali.postinst，需要另外下载
         mkdir -p cdrom/simple-cdd
-        curl -Lo cdrom/simple-cdd/kali.postinst https://gitlab.com/kalilinux/build-scripts/kali-live/-/raw/main/kali-config/common/includes.installer/kali-finish-install?ref_type=heads
+        curl -Lo cdrom/simple-cdd/kali.postinst https://gitlab.com/kalilinux/build-scripts/kali-installer/-/raw/main/simple-cdd/profiles/kali.postinst?ref_type=heads
         chmod a+x cdrom/simple-cdd/kali.postinst
+
+        # kali simple-cdd 阶段将 apt 源改成 deb822 格式
+        # 但是写死了 http://http.kali.org/kali/ 和 kali-rolling
+        # 因此在这里改回去
+        # https://gitlab.com/kalilinux/build-scripts/kali-installer/-/raw/main/simple-cdd/profiles/kali.postinst?ref_type=heads
+        sed -E -i \
+            -e "s|^URIs: http://http.kali.org/kali/$|URIs: http://$nextos_deb_mirror/|" \
+            -e "s|^Suites: kali-rolling$|Suites: $nextos_codename|" \
+            cdrom/simple-cdd/kali.postinst
     fi
 
     # 安装 kali-last-snapshot 时
@@ -3899,15 +3980,6 @@ EOF
             etc/default-release \
             etc/udebs-source
     fi
-
-    # 无论是 netboot kali-last-snapshot 还是 kali-linux-202x.x-installer-netinst-amd64.iso
-    # tasksel 安装 openssh-server 时已经在用 /target 的源了，也就是 kali-rolling
-    # 我们遇到过 kali-rolling 的 openssh-server 有问题无法安装
-    # https://bugs.kali.org/view.php?id=9847
-    # https://bugs.kali.org/view.php?id=9853
-    # 如果要规避这种情况，或者想安装纯血 kali-last-snapshot
-    # debootstrap 后马上修改 apt 源应该可以做到
-    # 相关位置 /usr/lib/post-base-installer.d/
 
     if [ "$distro" = debian ] && is_debian_elts; then
         curl -Lo usr/share/keyrings/debian-archive-keyring.gpg https://deb.freexian.com/extended-lts/archive-key.gpg
@@ -4408,14 +4480,15 @@ remove_useless_initrd_files() {
         done
     )
     (
+        # 甲骨文 arm64 是 usb 键盘
+        # cat /proc/bus/input/devices
+
         cd lib/modules/*/kernel
         for item in \
             net/mac80211 \
             net/wireless \
             net/bluetooth \
-            drivers/hid \
             drivers/mtd \
-            drivers/usb \
             drivers/ssb \
             drivers/mfd \
             drivers/bcma \
@@ -4427,7 +4500,6 @@ remove_useless_initrd_files() {
             drivers/net/bonding \
             drivers/net/wireless \
             drivers/input/rmi4 \
-            drivers/input/keyboard \
             drivers/input/touchscreen \
             drivers/bus/mhi \
             drivers/char/pcmcia \
@@ -4773,7 +4845,7 @@ fi
 
 # 整理参数
 long_opts=
-for o in ci installer debug minimal no-cloud-kernel allow-ping force-cn help \
+for o in ci installer debug minimal no-cloud-kernel no-auto-drivers allow-ping force-cn help \
     add-driver: \
     hold: sleep: \
     iso: \
@@ -4871,6 +4943,10 @@ while true; do
         ;;
     --no-cloud-kernel)
         no_cloud_kernel=1
+        shift
+        ;;
+    --no-auto-drivers)
+        no_auto_drivers=1
         shift
         ;;
     --allow-ping)

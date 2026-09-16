@@ -52,7 +52,7 @@ The system requirements for the target system are as follows:
 | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- | --------- | ---------------- |
 | <img width="16" height="16" src="https://www.alpinelinux.org/alpine-logo.ico" /> Alpine                                                                                                                                                                                                                                                                                | 3.21, 3.22, 3.23, 3.24                | 256 MB    | 1 GB             |
 | <img width="16" height="16" src="https://www.debian.org/favicon.ico" /> Debian                                                                                                                                                                                                                                                                                         | 9 ELTS - 11 ELTS, 12, 13              | 256 MB    | 1 ~ 1.5 GB ^     |
-| <img width="16" height="16" src="https://github.com/bin456789/reinstall/assets/7548515/f74b3d5b-085f-4df3-bcc9-8a9bd80bb16d" /> Kali                                                                                                                                                                                                                                   | Rolling                               | 256 MB    | 1 ~ 1.5 GB ^     |
+| <img width="16" height="16" src="https://github.com/bin456789/reinstall/assets/7548515/f74b3d5b-085f-4df3-bcc9-8a9bd80bb16d" /> Kali                                                                                                                                                                                                                                   | Last-Snapshot, Rolling                | 256 MB    | 1 ~ 1.5 GB ^     |
 | <img width="16" height="16" src="https://documentation.ubuntu.com/server/_static/favicon.png" /> Ubuntu                                                                                                                                                                                                                                                                | 18.04 LTS - 26.04 LTS                 | 512 MB \* | 2 GB             |
 | <img width="16" height="16" src="https://img.alicdn.com/imgextra/i1/O1CN01oJnJZg1yK4RzI4Rx2_!!6000000006559-2-tps-118-118.png" /> Anolis                                                                                                                                                                                                                               | 7, 8, 23                              | 512 MB \* | 5 GB             |
 | <img width="16" height="16" src="https://www.redhat.com/favicon.ico" /> RHEL &nbsp;<img width="16" height="16" src="https://almalinux.org/fav/favicon.ico" /> AlmaLinux &nbsp;<img width="16" height="16" src="https://rockylinux.org/favicon.png" /> Rocky &nbsp;<img width="16" height="16" src="https://www.oracle.com/asset/web/favicons/favicon-32.png" /> Oracle | 8, 9, 10                              | 512 MB \* | 5 GB             |
@@ -173,8 +173,8 @@ bash reinstall.sh anolis      7|8|23
                   opensuse    16.0|tumbleweed
                   openeuler   20.03|22.03|24.03
                   alpine      3.21|3.22|3.23|3.24
+                  kali        last-snapshot|rolling
                   ubuntu      18.04|20.04|22.04|24.04|26.04 [--minimal]
-                  kali
                   arch
                   gentoo
                   aosc
@@ -581,11 +581,12 @@ bash reinstall.sh windows \
 - `--add-driver INF_OR_DIR` Add additional driver, specifying .inf path, or the folder contains .inf file.
   - The driver must be downloaded to current system first.
   - This parameter can be set multiple times to add different driver.
+- `--no-auto-drivers` Prevent the script automatically download drivers. You need to use `--add-driver` to add the missing drivers.
 - `--frpc-config PATH` Add frpc for intranet tunneling. Parameter can be local filepath or HTTP URL of the configuration file.
 - `--hold 1` Reboot only into install environment, without running installer, only for SSH connect to test network connection.
 - `--hold 2` Allow SSH connections for modifying `boot.wim`, `install.wim` or other contents before rebooting into the official Windows installation program, with the disk mounted at `/os`.
 
-#### The following drivers will automatic download and install as needed, without the need for manual addition
+#### The following drivers will be downloaded and installed automatically as needed; use `--no-auto-drivers` to disable this feature
 
 - VirtIO ([Community][virtio-virtio], [Alibaba Cloud][virtio-aliyun], [Tencent Cloud][virtio-qcloud], [GCP][virtio-gcp], [GCP (Win7/2008 SHA-1)][virtio-gcp-win6.1sha1]))
 - XEN ([~~Community~~][xen-xen] (unsigned), [Citrix][xen-citrix], [AWS][xen-aws])
