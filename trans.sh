@@ -10,7 +10,7 @@ set -eE
 
 # 用于判断 reinstall.sh 和 trans.sh 是否兼容
 # shellcheck disable=SC2034
-SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0004
+SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0005
 
 TRUE=0
 FALSE=1
@@ -1163,6 +1163,10 @@ insert_into_file() {
 
         case "$location" in
         before) line_num=$((line_num - 1)) ;;
+        replace)
+            sed -i "${line_num}d" "$file"
+            line_num=$((line_num - 1))
+            ;;
         after) ;;
         *) return 1 ;;
         esac
@@ -1711,20 +1715,6 @@ install_alpine() {
         set_ssh_keys_and_del_password /os
     fi
 
-    # alpine 3.24+
-    # 要从 /etc/inittab 删除多余的 tty0
-    # 否则开机时 vnc 会有两个登录提示，一个是 tty0，一个是 tty1
-
-    # sed 找到 # enable login on alternative console 的行
-    # 用 N 读取下一行到当前空间
-    # 再匹配 \ntty0:
-    sed -i '
-/^# enable login on alternative console$/{
-    N
-    /\ntty0:/d
-}
-' /os/etc/inittab
-
     # 下载 fix-eth-name
     download "$confhome/fix-eth-name.sh" /os/fix-eth-name.sh
     download "$confhome/fix-eth-name.initd" /os/etc/init.d/fix-eth-name
@@ -1812,7 +1802,8 @@ install_nixos() {
     ram_per_thread=2048
 
     threads=$(get_build_threads $ram_per_thread)
-    swap_size=$(get_need_swap_size $ram_per_thread)
+    # 最少需要的总内存 = 1 个编译线程所需的内存 + Alpine Live OS 所需的内存 (512M)
+    swap_size=$(get_need_swap_size $((ram_per_thread + 512)))
 
     show_nixos_config() {
         echo
@@ -2073,6 +2064,21 @@ EOF
         )
     fi
 
+    if is_tencent_cloud; then
+        # 不能用 /bin/sh 和 /bin/echo
+        # /nix/store/84akrjvm0clyjkwx3agr03j2iz1w4kxi-initrd-udev-rules/99-local.rules (origin unknown) contains references to /bin/sh and /bin/echo.
+        nix_udev_rules=$(
+            cat <<EOF
+services.udev.extraRules = ''
+  KERNEL=="vd*[a-z]", ACTION=="add|change", SUBSYSTEM=="block", ATTR{queue/max_sectors_kb}="512"
+'';
+boot.initrd.services.udev.rules = ''
+  KERNEL=="vd*[a-z]", ACTION=="add|change", SUBSYSTEM=="block", ATTR{queue/max_sectors_kb}="512"
+'';
+EOF
+        )
+    fi
+
     # TODO: 准确匹配网卡，添加 udev 或者直接配置 networkd 匹配 mac
     create_nixos_network_config /tmp/nixos_network_config.nix
 
@@ -2085,6 +2091,7 @@ boot.kernelParams = [ $(get_ttys console= | quote_word) ];
 $nix_users
 $nix_openssh
 $nix_frpc
+$nix_udev_rules
 $(cat /tmp/nixos_network_config.nix)
 ###################################################
 EOF
@@ -4098,7 +4105,7 @@ EOF
     fi
 
     # opensuse
-    # 1. kernel-default-base 缺少 nvme gve mlx5 mana 驱动，换成 kernel-default
+    # 1. kernel-default-base 缺少 ena gve mlx mana 驱动，换成 kernel-default
     # 2. 添加微码+固件
     # https://documentation.suse.com/smart/virtualization-cloud/html/minimal-vm/index.html
     if grep -q opensuse $os_dir/etc/os-release; then
@@ -4120,11 +4127,18 @@ EOF
         rm /net.cfg
 
         # 选择新内核
-        # 只有 leap 有 kernel-azure
-        if grep -iq leap $os_dir/etc/os-release && [ "$(get_cloud_vendor)" = azure ]; then
-            target_kernel='kernel-azure'
-        else
+        if [ "$no_cloud_kernel" = 1 ]; then
             target_kernel='kernel-default'
+        else
+            # 只有 leap 有 kernel-azure
+            # shellcheck disable=SC2046
+            if grep -iq leap $os_dir/etc/os-release && [ "$(get_cloud_vendor)" = azure ]; then
+                target_kernel='kernel-azure'
+            elif sh /can_use_cloud_kernel.sh "$xda" $(get_eths); then
+                target_kernel='kernel-default-base'
+            else
+                target_kernel='kernel-default'
+            fi
         fi
 
         # rpm -qi 不支持通配符
@@ -4657,10 +4671,17 @@ add_user_if_need() {
             chroot "$os_dir" adduser --help 2>&1 | grep -Fq -- BusyBox; then
             chroot "$os_dir" adduser --disabled-password "$username"
 
-        # debian/ubuntu
+        # 新版 debian/ubuntu
         elif is_have_cmd_on_disk "$os_dir" adduser &&
-            chroot "$os_dir" adduser --help 2>&1 | grep -Fq -- '--disabled-password'; then
+            chroot "$os_dir" adduser --help 2>&1 | grep -Fq -- '--disabled-password' &&
+            chroot "$os_dir" adduser --help 2>&1 | grep -Fq -- '--comment'; then
             chroot "$os_dir" adduser --disabled-password --comment '' "$username"
+
+        # 旧版 debian/ubuntu
+        elif is_have_cmd_on_disk "$os_dir" adduser &&
+            chroot "$os_dir" adduser --help 2>&1 | grep -Fq -- '--disabled-password' &&
+            chroot "$os_dir" adduser --help 2>&1 | grep -Fq -- '--gecos'; then
+            chroot "$os_dir" adduser --disabled-password --gecos '' "$username"
 
         # el
         elif is_have_cmd_on_disk "$os_dir" adduser &&
@@ -6478,6 +6499,13 @@ get_drivers() {
     )
 }
 
+is_xda_non_standard_virtio_scsi() {
+    get_drivers "/sys/class/block/$xda" | grep -q virtio_scsi &&
+        device_path="$(readlink -f "/sys/class/block/$xda" | sed 's,/virtio.*,,')" &&
+        [ -e "$device_path/subsystem_vendor" ] &&
+        ! [ "$(cat "$device_path/subsystem_vendor")" = 0x1af4 ]
+}
+
 get_windows_type_from_windows_drive() {
     local os_dir=$1
 
@@ -6966,7 +6994,7 @@ install_windows() {
         if is_virt_contains virtio; then
             if [ "$vendor" = aliyun ] && is_nt_ver_ge 6.1 && [ "$arch_wim" = x86_64 ]; then
                 add_driver_aliyun_virtio
-            elif [ "$vendor" = qcloud ] && is_nt_ver_ge 6.1 && [ "$arch_wim" = x86_64 ]; then
+            elif [ "$vendor" = qcloud ] && is_nt_ver_ge 6.0 && { [ "$arch_wim" = x86 ] || [ "$arch_wim" = x86_64 ]; }; then
                 add_driver_qcloud_virtio
             # 未测试是否需要专用驱动
             elif false && [ "$vendor" = huawei ] && is_nt_ver_ge 6.0 && { [ "$arch_wim" = x86 ] || [ "$arch_wim" = x86_64 ]; }; then
@@ -7542,24 +7570,36 @@ EOF
         }
 
         case "$nt_ver" in
-        6.0 | 6.1) $support_sha256 &&
-            dir=archive-virtio/virtio-win-0.1.187-1 ||
-            dir=archive-virtio/virtio-win-0.1.173-9 ;;        # vista|w7|2k8|2k8R2
+        6.0 | 6.1)
+            if $support_sha256; then
+                if is_xda_non_standard_virtio_scsi; then
+                    dir=archive-virtio/virtio-win-0.1.187-1 # 甲骨文
+                else
+                    dir=stable-virtio
+                fi
+            else
+                dir=archive-virtio/virtio-win-0.1.173-9
+            fi
+            ;;                                                # vista|w7|2k8|2k8R2
         6.2 | 6.3) dir=archive-virtio/virtio-win-0.1.215-2 ;; # w8|w8.1|2k12|2k12R2
-        *)
-            # 先获取最新版本号，再下载
-            # 用 stable-virtio 的话国内镜像下载的可能是缓存的旧版
+        *) dir=stable-virtio ;;
+        esac
 
-            # anubis 默认策略拉黑了华为云，连验证的机会都没有
+        # 先获取最新版本号，再下载
+        # 用 stable-virtio 的话国内镜像下载的可能是缓存的旧版
 
-            # https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/
-            # 路径是网页，可能会弹出 anubis 验证
+        # anubis 默认策略拉黑了华为云，连验证的机会都没有
 
-            # https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/CHECKSUM
-            # 路径是文件，应该不会弹出 anubis 验证？
+        # https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/
+        # 路径是网页，可能会弹出 anubis 验证
+
+        # https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/CHECKSUM
+        # 路径是文件，应该不会弹出 anubis 验证？
+        if [ "$dir" = stable-virtio ]; then
             if ! dir=$(get_latest_virtio_dir "$baseurl"); then
-                mirror_baseurl=https://files.m.daocloud.io/$(echo "$baseurl" | sed -E 's,^https?://,,i')
-                if is_any_ipv4_has_internet && dir=$(get_latest_virtio_dir "$mirror_baseurl"); then
+                if is_any_ipv4_has_internet &&
+                    mirror_baseurl=https://files.m.daocloud.io/$(echo "$baseurl" | sed -E 's,^https?://,,i') &&
+                    dir=$(get_latest_virtio_dir "$mirror_baseurl"); then
                     baseurl=$mirror_baseurl
                 elif [ "$arch_wim" = x86 ] || [ "$arch_wim" = x86_64 ]; then
                     add_driver_virtio_from_rpm "$@"
@@ -7568,9 +7608,7 @@ EOF
                     error_and_exit "Failed to get latest virtio-win version."
                 fi
             fi
-            # dir=stable-virtio
-            ;;
-        esac
+        fi
 
         # 如果 dir 包含数字，则是从具体版本号文件夹下载，文件不会更新，可以使用国内镜像
         if [[ "$dir" =~ [0-9] ]]; then
@@ -7649,9 +7687,86 @@ EOF
     add_driver_qcloud_virtio() {
         info "Add drivers: QCloud virtio"
 
-        # 测试版?
-        # https://mirrors.tencent.com/install/cts/windows/Drivers.zip
+        # 标准型S8 | S8.LARGE8 实例安装 32 位 win10
+        # PE 阶段加载社区版 viostor 驱动后会自动重启
+        # 因此 32 位也需要用腾讯云版驱动
 
+        # 下面的版本以 win10 viostor amd64 inf 为准
+
+        # 58005 没有 32 位
+        # https://mirrors.tencent.com/install/windows/virtio_64_1.0.9.exe
+
+        # 58007 没有气球驱动
+        # https://windows-1251783334.cos.ap-shanghai.myqcloud.com/Win7_Win2008R2.zip                 有 32 位
+        # https://windows-1251783334.cos.ap-shanghai.myqcloud.com/Win8.1_Win2012R2.zip               有 32 位
+        # https://windows-1251783334.cos.ap-shanghai.myqcloud.com/Win10_2016_2019.zip                有 32 位
+        # https://windows-1251783334.cos.ap-shanghai.myqcloud.com/VirtIO_Win_58007.zip               有 32 位
+        # https://windows-1251783334.cos.ap-shanghai.myqcloud.com/Install_QCloudVirtIO.zip           只有 win10 有 32 位
+        # https://go2tencentcloud-1251783334.cos.accelerate.tencentcos.cn/latest/go2tencentcloud.zip 没有 32 位
+
+        # 58010
+        # https://windows-1251783334.cos.ap-shanghai.myqcloud.com/Install_KVMVirtIO.zip           只有 win10 有 32 位，没有气球驱动，netkvm 是社区版
+        # https://windows-1251783334.cos.ap-shanghai.myqcloud.com/Install_QCloudVirtIO_new.zip    只有 win10 有 32 位，只有 win10 有气球驱动
+        # https://winpecheck-1251783334.cos.accelerate.tencentcos.cn/Install_QCloudVirtIO_new.zip
+        # https://mirrors.tencent.com/install/cts/windows/Drivers.zip                             有 32 位，没有气球驱动
+        # https://mirrors.tencent.com/install/cts/windows/AllTools/Drivers.zip
+
+        # 腾讯云 windows server 2025 系统镜像，驱动是 58010
+
+        # Install_QCloudVirtIO_new.zip 可视为稳定版
+        # 因为 WinPE-Diag.7z\checks\50-DriverCleanup.ps1 用的是 Install_QCloudVirtIO_new.zip
+        # https://mirrors.tencent.com/install/cts/windows/WinPE-Diag.7z
+
+        # 第 1 步
+        # 从 Drivers.zip 获取 viostor netkvm qxldod 驱动
+        # 里面的 qxldod windows server 驱动和普通 windows 驱动文件相同
+        # XP 文件夹有个中文文件，busybox unzip 解压会报错，因此排除该文件夹
+        download https://mirrors.tencent.com/install/cts/windows/Drivers.zip $drv/Drivers.zip
+        unzip $drv/Drivers.zip -d $drv/qcloud/
+        unzip $drv/qcloud/Drivers/VirtIO_Win_20250827.zip -d $drv/qcloud/ -x '*/XP/*'
+
+        drivers=$(
+            case "$nt_ver" in
+            6.0)
+                # sha1
+                echo VioStor/Vista_Win2008
+                echo NetKVM/Vista_Win2008
+                # 没有 qxl/qxldod
+                ;;
+            6.1)
+                # sha1
+                echo VioStor/Win7_2008R2
+                echo NetKVM/Win7_Win2008R2
+                # 没有 qxl/qxldod
+                ;;
+            6.2)
+                echo VioStor/Win8_8.1_2012_2012R2
+                echo NetKVM/Win8_Win2012
+                echo qxldod/w8
+                ;;
+            6.3)
+                echo VioStor/Win8_8.1_2012_2012R2
+                echo NetKVM/Win8.1_Win2012R2
+                echo qxldod/w8.1
+                ;;
+            *)
+                echo VioStor/Win10_2016_2019
+                echo NetKVM/Win10_2016_2019
+                echo qxldod/w10
+                ;;
+            esac
+        )
+
+        local dir
+        for dir in $drivers; do
+            cp_drivers "$drv/qcloud/VirtIO_Win_20250827/$dir/$arch"
+        done
+
+        # 第 2 步
+        # 从 virtio_64_1.0.9.exe 获取气球驱动
+        if ! { is_nt_ver_ge 6.1 && [ "$arch_wim" = x86_64 ]; }; then
+            return
+        fi
         apk add 7zip
         download https://mirrors.tencent.com/install/windows/virtio_64_1.0.9.exe $drv/virtio.exe true
         exclude='$*' # 排除 $PLUGINSDIR
@@ -7680,6 +7795,10 @@ EOF
 
         for old_name in $drivers; do
             part=${old_name%%_*}
+            # 只复制气球驱动
+            if ! [ "$part" = "balloon" ]; then
+                continue
+            fi
             if ! [ "$old_name" = "$part" ]; then
                 find $drv/qcloud/$part -type f -iname "$old_name.*" | while read -r file; do
                     ext="${file##*.}"
@@ -8370,6 +8489,87 @@ get_ubuntu_kernel_flavor() {
     esac
 }
 
+is_tencent_cloud() {
+    [ "$(cat /sys/devices/virtual/dmi/id/sys_vendor 2>/dev/null)" = 'Tencent Cloud' ]
+}
+
+add_max_sectors_kb_rule() {
+    local os_dir=$1
+
+    # 普通发行版
+    if [ -d $os_dir/etc/udev/rules.d/ ]; then
+        # 取自腾讯云 ubuntu 26.04 镜像
+        cat <<EOF >$os_dir/etc/udev/rules.d/80-max-sectors-blk.rules
+KERNEL=="vd*[a-z]", ACTION=="add|change", SUBSYSTEM=="block", RUN+="/bin/sh -c '/bin/echo 512 > /sys/%p/queue/max_sectors_kb'"
+EOF
+
+    # alpine
+    elif [ -f $os_dir/etc/mdev.conf ]; then
+        if ! grep -Eq '^vd.*max_sectors_kb' "$os_dir/etc/mdev.conf"; then
+            # shellcheck disable=SC2016
+            sed -Ei \
+                '/^vd\[a-z\]/s,$,; case "$ACTION" in add|change) if [[ "$MDEV" =~ [a-z]$ ]]; then echo 512 >/sys/class/block/$MDEV/queue/max_sectors_kb; fi;; esac,' \
+                "$os_dir/etc/mdev.conf"
+        fi
+    fi
+
+}
+
+set_max_sectors_kb_for_tencent_cloud_liveos() {
+    if is_tencent_cloud; then
+        local block
+        for block in /sys/class/block/vd[a-z]; do
+            if [ -d "$block" ]; then
+                echo 512 >"$block/queue/max_sectors_kb"
+            fi
+        done
+        add_max_sectors_kb_rule /
+        rc-service mdev restart
+        sleep 1
+        # update_part
+    fi
+}
+
+set_max_sectors_kb_for_tencent_cloud_persist() {
+    local os_dir etc_dir
+    if is_tencent_cloud && etc_dir=$({ ls -d /os/etc/ || ls -d /os/*/etc/; } 2>/dev/null); then
+        os_dir=$(dirname $etc_dir)
+        # 重新挂载为读写
+        mount -o remount,rw /os
+
+        # rule
+        add_max_sectors_kb_rule "$os_dir"
+
+        # swap on
+        # dracut 需要大量内存
+        # 防止之前有 swap
+        swapoff -a
+        rm -f $os_dir/swapfile
+        create_swap_if_ram_less_than 2048 $os_dir/swapfile
+
+        # 重新生成 initramfs
+        # el
+        if is_have_cmd_on_disk $os_dir dracut; then
+            chroot $os_dir dracut -f --regenerate-all
+        # debian/ubuntu
+        elif is_have_cmd_on_disk $os_dir update-initramfs; then
+            chroot $os_dir update-initramfs -u -k all
+        # arch
+        elif is_have_cmd_on_disk $os_dir mkinitcpio; then
+            echo 'FILES+=(/etc/udev/rules.d/80-max-sectors-blk.rules)' \
+                >$os_dir/etc/mkinitcpio.conf.d/80-max-sectors-blk.conf
+            chroot $os_dir mkinitcpio -P
+        # alpine
+        elif is_have_cmd_on_disk $os_dir mkinitfs; then
+            chroot $os_dir mkinitfs
+        fi
+
+        # swap off
+        swapoff -a
+        rm -f $os_dir/swapfile
+    fi
+}
+
 install_redhat_ubuntu() {
     info "Download iso installer"
 
@@ -8486,6 +8686,9 @@ trans() {
         find_xda
     fi
 
+    # 腾讯云特殊处理
+    set_max_sectors_kb_for_tencent_cloud_liveos
+
     if [ "$distro" != "alpine" ]; then
         setup_web_if_enough_ram
         # util-linux 包含 lsblk
@@ -8575,6 +8778,11 @@ trans() {
             esac
             ;;
         esac
+    fi
+
+    # 腾讯云特殊处理
+    if ! { [ "$distro" = dd ] || [ "$distro" = nixos ]; }; then
+        set_max_sectors_kb_for_tencent_cloud_persist
     fi
 
     # 需要用到 lsblk efibootmgr ，只要 1M 左右容量
