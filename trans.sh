@@ -824,6 +824,18 @@ is_dhcpv6_or_slaac() {
     [ "$dhcpv6_or_slaac" = 1 ]
 }
 
+_should_add_ipv4_static_dns() {
+    get_netconf_to should_add_ipv4_static_dns
+    # shellcheck disable=SC2154
+    [ "$should_add_ipv4_static_dns" = 1 ]
+}
+
+_should_add_ipv6_static_dns() {
+    get_netconf_to should_add_ipv6_static_dns
+    # shellcheck disable=SC2154
+    [ "$should_add_ipv6_static_dns" = 1 ]
+}
+
 is_ipv4_has_internet() {
     get_netconf_to ipv4_has_internet
     # shellcheck disable=SC2154
@@ -888,15 +900,11 @@ is_dhcpv6() {
     # 部分系统开机需要等 DHCPv6 超时
     # 这种情况需要禁用 DHCPv6
     if [ "$dhcpv6" = 1 ] && ! ip -6 -o addr show scope global dev "$ethx" | grep -q .; then
-        echo 'DHCPv6 flag is on, but DHCPv6 is not working.'
+        echo 'DHCPv6 flag is on, but DHCPv6 is not working.' >&2
         return 1
     fi
 
     [ "$dhcpv6" = 1 ]
-}
-
-is_have_ipv6() {
-    is_slaac || is_dhcpv6 || is_staticv6
 }
 
 is_enable_other_flag() {
@@ -988,12 +996,41 @@ is_need_change_rdp_port() {
     [ -n "$rdp_port" ] && ! [ "$rdp_port" = 3389 ]
 }
 
-is_need_manual_set_dnsv6() {
-    # 有没有可能是静态但是有 rdnss？
-    ! is_have_ipv6 && return $FALSE
-    is_dhcpv6 && return $FALSE
+should_add_ipv4_static_dns() {
+    # 无 ip 直接返回 FALSE
+    if ! { is_dhcpv4 || is_staticv4; }; then
+        return $FALSE
+    fi
+
+    # initrd-network 检测到需要手动设置 dns
+    if _should_add_ipv4_static_dns; then
+        return $TRUE
+    fi
+
+    # 正常情况
+    is_dhcpv4 && return $FALSE
+    is_staticv4 && return $TRUE
+}
+
+should_add_ipv6_static_dns() {
+    # 无 ip 直接返回 FALSE
+    if ! { is_slaac || is_dhcpv6 || is_staticv6; }; then
+        return $FALSE
+    fi
+
+    # initrd-network 检测到需要手动设置 dns
+    if _should_add_ipv6_static_dns; then
+        return $TRUE
+    fi
+
+    # 静态 ipv6 也可能有 rdnss？而且要配置客户端 dhcpv6 软件只获取 dns，目前没处理这种
     is_staticv6 && return $TRUE
-    is_slaac && ! is_enable_other_flag &&
+
+    # 有 slaac/dhcpv6 不代表有 rdnss 或 other flag，例如甲骨文
+
+    # dhcpv6 dns (other flag) 和 rdnss 都不能使用时才返回 $TRUE
+    { is_slaac || is_dhcpv6; } &&
+        ! is_enable_other_flag &&
         { ! is_have_rdnss || { is_have_rdnss && is_windows && ! is_windows_support_rdnss; }; }
 }
 
@@ -1246,19 +1283,22 @@ EOF
         } >>$conf_file
 
         # ipv4
-        if is_dhcpv4; then
-            echo "iface $ethx inet dhcp" >>$conf_file
-
-        elif is_staticv4; then
-            get_netconf_to ipv4_addr
-            get_netconf_to ipv4_gateway
-            cat <<EOF >>$conf_file
+        if is_dhcpv4 || is_staticv4; then
+            # ip
+            if is_dhcpv4; then
+                echo "iface $ethx inet dhcp" >>$conf_file
+            elif is_staticv4; then
+                get_netconf_to ipv4_addr
+                get_netconf_to ipv4_gateway
+                cat <<EOF >>$conf_file
 iface $ethx inet static
     address $ipv4_addr
     gateway $ipv4_gateway
 EOF
+            fi
             # dns
-            if list=$(get_current_dns 4); then
+            if should_add_ipv4_static_dns &&
+                list=$(get_current_dns 4); then
                 for dns in $list; do
                     cat <<EOF >>$conf_file
     dns-nameservers $dns
@@ -1330,7 +1370,7 @@ EOF
         fi
         # dns
         # 有 ipv6 但需设置 dns 的情况
-        if is_need_manual_set_dnsv6; then
+        if should_add_ipv6_static_dns; then
             for dns in $(get_current_dns 6); do
                 cat <<EOF >>$conf_file
     dns-nameserver $dns
@@ -1470,7 +1510,7 @@ EOF
     # 全局 dns
     need_set_dns=false
     for ethx in $(get_eths); do
-        if is_staticv4 || is_staticv6 || is_need_manual_set_dnsv6; then
+        if should_add_ipv4_static_dns || should_add_ipv6_static_dns; then
             need_set_dns=true
             break
         fi
@@ -2341,8 +2381,18 @@ install_arch_gentoo_aosc() {
     )
 
     set_locale() {
-        echo "C.UTF-8 UTF-8" >>$os_dir/etc/locale.gen
+        # 如果存在注释/非注释的 en_US.UTF-8 UTF-8
+        # 则取消注释
+        if grep -Eq '^[# ]*en_US\.UTF-8 UTF-8' $os_dir/etc/locale.gen; then
+            sed -Ei 's/^[# ]*en_US\.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' $os_dir/etc/locale.gen
+        else
+            echo 'en_US.UTF-8 UTF-8' >>$os_dir/etc/locale.gen
+        fi
         chroot $os_dir locale-gen
+
+        # chroot $os_dir localectl set-locale en_US.UTF-8
+        # chroot $os_dir systemd-firstboot --locale=en_US.UTF-8 --force
+        echo 'LANG=en_US.UTF-8' >$os_dir/etc/locale.conf
     }
 
     # shellcheck disable=SC2317
@@ -2367,7 +2417,7 @@ install_arch_gentoo_aosc() {
 
         # 设置 repo
         insert_into_file $alpine_rootfs/etc/pacman.conf before '\[core\]' <<EOF
-SigLevel = Never
+SigLevel = Required DatabaseOptional
 ParallelDownloads = 5
 EOF
         cat <<EOF >>$alpine_rootfs/etc/pacman.conf
@@ -2380,11 +2430,46 @@ EOF
         mkdir -p $alpine_rootfs/etc/pacman.d
         # shellcheck disable=SC2016
         case "$(uname -m)" in
-        x86_64) dir='$repo/os/$arch' ;;
-        aarch64) dir='$arch/$repo' ;;
+        x86_64) repo_pattem='$repo/os/$arch' ;;
+        aarch64) repo_pattem='$arch/$repo' ;;
         esac
-        # shellcheck disable=SC2154
-        echo "Server = $mirror/$dir" >$alpine_rootfs/etc/pacman.d/mirrorlist
+        echo "Server = $mirror/$repo_pattem" >$alpine_rootfs/etc/pacman.d/mirrorlist
+
+        # 下载 core.db
+        core_dir=$(echo "$repo_pattem" | sed -e "s/\$repo/core/" -e "s/\$arch/$(uname -m)/")
+        download $mirror/$core_dir/core.db $alpine_rootfs/tmp/core.db
+
+        # 下载 archlinux-keyring archlinuxarm-keyring 包
+        # arch x86 是 tar.zst
+        # arch arm 是 tar.xz
+        xz_or_zstd=$([ "$(uname -m)" = aarch64 ] && echo xz || echo zstd)
+        apk add tar file $xz_or_zstd
+
+        keyrings=archlinux-keyring
+        if [ "$(uname -m)" = aarch64 ]; then
+            keyrings="$keyrings archlinuxarm-keyring"
+        fi
+
+        for keyring in $keyrings; do
+            # 找到包名
+            keyring_pkg_tar_xx=$(tar -xf $alpine_rootfs/tmp/core.db -O --wildcards "$keyring-*/desc" |
+                grep "^$keyring-.*-any\.pkg\.tar\..*" | sort -Vr | head -1)
+
+            # 下载并解压
+            download $mirror/$core_dir/$keyring_pkg_tar_xx $alpine_rootfs/tmp/$keyring_pkg_tar_xx
+            tar -xf $alpine_rootfs/tmp/$keyring_pkg_tar_xx \
+                -C $alpine_rootfs \
+                usr/share/pacman/keyrings/
+            rm -f $alpine_rootfs/tmp/$keyring_pkg_tar_xx
+        done
+
+        # 清理
+        rm -f $alpine_rootfs/tmp/core.db
+        apk del tar file $xz_or_zstd
+
+        # 初始化 pacman keyring
+        chroot $alpine_rootfs pacman-key --init
+        chroot $alpine_rootfs pacman-key --populate
 
         # 安装系统
         # 要安装分区工具(包含 fsck.xxx)，用于 initramfs 检查分区数据
@@ -2432,9 +2517,6 @@ EOF
         # bsdtar: bsdtar: Failed to set default locale
         # Failed to set default locale
         set_locale
-        if [ "$(uname -m)" = aarch64 ]; then
-            chroot $os_dir pacman-key --lsign-key builder@archlinuxarm.org
-        fi
 
         # firmware + microcode
         if fw_pkgs=$(get_ucode_firmware_pkgs) && [ -n "$fw_pkgs" ]; then
@@ -2650,12 +2732,14 @@ EOF
         chroot $os_dir systemctl enable systemd-resolved
 
         apk add cloud-init
-        # 第二次运行会报错
-        useradd systemd-network || true
         create_cloud_init_network_config net.cfg
         cat -n net.cfg
-        # 正常应该是 -D gentoo，但 alpine 的 cloud-init 包缺少 gentoo 配置
+
+        # cloud-init 渲染 networkd 配置时，系统要有 systemd-network 用户，不然会报错
+        # 加 || true 防止第二次运行报错
+        useradd --system systemd-network || true
         cloud-init devel net-convert -p net.cfg -k yaml -d out -D alpine -O networkd
+        userdel -r systemd-network
 
         # 注意名字是 10-cloud-init-eth*.network，fix-eth-name.sh 会此文件名查找配置文件
         cp out/etc/systemd/network/10-cloud-init-eth*.network $os_dir/etc/systemd/network/
@@ -2935,6 +3019,11 @@ create_part() {
     wipefs -a -f /dev/$xda
     apk del wipefs
 
+    # 下面用 dd 擦除 bios_grub 分区
+    # 因为硬盘同时存在 efi bios_grub 分区时
+    # efi 平台没用到 bios_grub 分区
+    # 不擦除 bios_grub 分区的话，parted 会显示残留的文件系统签名
+
     # shellcheck disable=SC2154
     if [ "$distro" = windows ]; then
         if ! size_bytes=$(get_link_file_size "$iso"); then
@@ -3056,8 +3145,8 @@ create_part() {
                 set 1 bios_grub on
             update_part
 
-            echo                                    #1 bios_boot
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 2)" #2 os + installer
+            dd if=/dev/zero of="/dev/$(xda 1)" bs=1M count=100 #1 bios_grub
+            mkfs.ext4 -F $ext4_opts "/dev/$(xda 2)"            #2 os + installer
         else
             # bios
             parted /dev/$xda -s -- \
@@ -3067,8 +3156,8 @@ create_part() {
                 set 2 boot on
             update_part
 
-            echo                                    #1 官方安装有这个分区
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 2)" #2 os + installer
+            dd if=/dev/zero of="/dev/$(xda 1)" bs=1M count=100 #1 官方安装有这个分区
+            mkfs.ext4 -F $ext4_opts "/dev/$(xda 2)"            #2 os + installer
         fi
     elif is_use_cloud_image; then
         installer_part_size="$(get_cloud_image_part_size)"
@@ -3100,9 +3189,9 @@ create_part() {
                     set 1 bios_grub on
                 update_part
 
-                echo                                      #1 bios_boot
-                echo                                      #2 os 用目标系统的格式化工具
-                mkfs.ext4 -F -L installer "/dev/$(xda 3)" #3 installer
+                dd if=/dev/zero of="/dev/$(xda 1)" bs=1M count=1 #1 bios_grub
+                echo                                             #2 os 用目标系统的格式化工具
+                mkfs.ext4 -F -L installer "/dev/$(xda 3)"        #3 installer
             fi
         else
             # 使用 dd qcow2
@@ -3142,8 +3231,8 @@ create_part() {
                 set 1 bios_grub on
             update_part
 
-            echo                                    #1 bios_boot
-            mkfs.ext4 -F $ext4_opts "/dev/$(xda 2)" #2 os
+            dd if=/dev/zero of="/dev/$(xda 1)" bs=1M count=1 #1 bios_grub
+            mkfs.ext4 -F $ext4_opts "/dev/$(xda 2)"          #2 os
         else
             # bios
             parted /dev/$xda -s -- \
@@ -3155,7 +3244,7 @@ create_part() {
             mkfs.ext4 -F $ext4_opts "/dev/$(xda 1)" #1 os
         fi
     else
-        # 安装红帽系或ubuntu
+        # iso 安装红帽系或ubuntu
         # 对于红帽系是临时分区表，安装时除了 installer 分区，其他分区会重建为默认的大小
         # 对于ubuntu是最终分区表，因为 ubuntu 的安装器不能调整个别分区，只能重建整个分区表
         # installer 2g分区用fat格式刚好塞得下ubuntu-22.04.3 iso，而ext4塞不下或者需要改参数
@@ -3198,7 +3287,7 @@ create_part() {
                 set 1 bios_grub on
             update_part
 
-            echo                                                 #1 bios_boot
+            dd if=/dev/zero of="/dev/$(xda 1)" bs=1M count=1     #1 bios_grub
             mkfs.ext4 -F -L os "/dev/$(xda 2)"                   #2 os
             mkfs.ext4 -F -L installer $ext4_opts "/dev/$(xda 3)" #3 installer
         else
@@ -3267,6 +3356,7 @@ create_cloud_init_network_config() {
 
     apk add yq-go
 
+    # 全局，不分网卡
     need_set_dns4=false
     need_set_dns6=false
 
@@ -3284,26 +3374,28 @@ create_cloud_init_network_config() {
         subnet_id=0
 
         # ipv4
-        if is_dhcpv4; then
-            yq -i ".network.config[$config_id].subnets[$subnet_id] = {\"type\": \"dhcp4\"}" $ci_file
-            subnet_id=$((subnet_id + 1))
-        elif is_staticv4; then
-            need_set_dns4=true
-            get_netconf_to ipv4_addr
-            get_netconf_to ipv4_gateway
-            yq -i ".network.config[$config_id].subnets[$subnet_id] = {
+        if is_dhcpv4 || is_staticv4; then
+            if is_dhcpv4; then
+                yq -i ".network.config[$config_id].subnets[$subnet_id] = {\"type\": \"dhcp4\"}" $ci_file
+            elif is_staticv4; then
+                get_netconf_to ipv4_addr
+                get_netconf_to ipv4_gateway
+                yq -i ".network.config[$config_id].subnets[$subnet_id] = {
                     \"type\": \"static\",
                     \"address\": \"$ipv4_addr\",
                     \"gateway\": \"$ipv4_gateway\" }
                     " $ci_file
-
-            # 旧版 cloud-init 有 bug
-            # 有的版本会只从第一种配置中读取 dns，有的从第二种读取
-            # 因此写两种配置
-            # https://github.com/canonical/cloud-init/commit/1b8030e0c7fd6fbff7e38ad1e3e6266ae50c83a5
-            for cur in $(get_current_dns 4); do
-                yq -i ".network.config[$config_id].subnets[$subnet_id].dns_nameservers += [\"$cur\"]" $ci_file
-            done
+            fi
+            if should_add_ipv4_static_dns; then
+                # 旧版 cloud-init 有 bug
+                # 有的版本会只从第一种配置中读取 dns，有的从第二种读取
+                # 因此写两种配置
+                # https://github.com/canonical/cloud-init/commit/1b8030e0c7fd6fbff7e38ad1e3e6266ae50c83a5
+                for cur in $(get_current_dns 4); do
+                    yq -i ".network.config[$config_id].subnets[$subnet_id].dns_nameservers += [\"$cur\"]" $ci_file
+                done
+                need_set_dns4=true
+            fi
             subnet_id=$((subnet_id + 1))
         fi
 
@@ -3353,7 +3445,7 @@ create_cloud_init_network_config() {
         fi
 
         # 有 ipv6 但需设置 dns 的情况
-        if is_need_manual_set_dnsv6; then
+        if should_add_ipv6_static_dns; then
             need_set_dns6=true
             for cur in $(get_current_dns 6); do
                 yq -i ".network.config[$config_id].subnets[$subnet_id].dns_nameservers += [\"$cur\"]" $ci_file
@@ -6264,7 +6356,7 @@ create_win_set_netconf_script() {
     target=$1
     info "Create win netconf script"
 
-    if is_staticv4 || is_staticv6 || is_need_manual_set_dnsv6; then
+    if is_staticv4 || is_staticv6 || should_add_ipv4_static_dns || should_add_ipv6_static_dns; then
         get_netconf_to mac_addr
         echo "set mac_addr=$mac_addr" >$target
 
@@ -6275,7 +6367,6 @@ create_win_set_netconf_script() {
             cat <<EOF >>$target
 set ipv4_addr=$ipv4_addr
 set ipv4_gateway=$ipv4_gateway
-$(get_dns_list_for_win 4)
 EOF
         fi
 
@@ -6289,8 +6380,15 @@ set ipv6_gateway=$ipv6_gateway
 EOF
         fi
 
+        # 有 ipv4 但需设置 dns 的情况
+        if should_add_ipv4_static_dns; then
+            cat <<EOF >>$target
+$(get_dns_list_for_win 4)
+EOF
+        fi
+
         # 有 ipv6 但需设置 dns 的情况
-        if is_need_manual_set_dnsv6; then
+        if should_add_ipv6_static_dns; then
             cat <<EOF >>$target
 $(get_dns_list_for_win 6)
 EOF
@@ -8458,10 +8556,10 @@ get_ubuntu_kernel_flavor() {
     # https://github.com/canonical/cloud-init/blob/main/tools/ds-identify
     # http://git.annexia.org/?p=virt-what.git;a=blob;f=virt-what.in;hb=HEAD
 
-    is_ubuntu_lts && suffix=-hwe-$releasever || suffix=
+    is_ubuntu_lts && hwe_suffix=-hwe-$releasever || hwe_suffix=
 
     if [ "$no_cloud_kernel" = 1 ]; then
-        echo generic$suffix
+        echo generic$hwe_suffix
         return
     fi
 
@@ -8486,9 +8584,9 @@ get_ubuntu_kernel_flavor() {
         if is_virt_contains vmware && [ "$releasever" = 24.04 ] && [ "$(uname -m)" = x86_64 ]; then
             echo vmware
         elif is_virt; then
-            echo virtual$suffix
+            echo virtual$hwe_suffix
         else
-            echo generic$suffix
+            echo generic$hwe_suffix
         fi
         ;;
     esac
@@ -8553,12 +8651,13 @@ set_max_sectors_kb_for_tencent_cloud_persist() {
         create_swap_if_ram_less_than 2048 $os_dir/swapfile
 
         # 重新生成 initramfs
-        # el
-        if is_have_cmd_on_disk $os_dir dracut; then
-            chroot $os_dir dracut -f --regenerate-all
         # debian/ubuntu
-        elif is_have_cmd_on_disk $os_dir update-initramfs; then
+        # 新版本 ubuntu 用的是 dracut，也有 update-initramfs 作为 wrapper
+        if is_have_cmd_on_disk $os_dir update-initramfs; then
             chroot $os_dir update-initramfs -u -k all
+        # el
+        elif is_have_cmd_on_disk $os_dir dracut; then
+            chroot $os_dir dracut -f --regenerate-all
         # arch
         elif is_have_cmd_on_disk $os_dir mkinitcpio; then
             echo 'FILES+=(/etc/udev/rules.d/80-max-sectors-blk.rules)' \

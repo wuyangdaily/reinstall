@@ -166,14 +166,26 @@ error_and_exit() {
     exit 1
 }
 
-show_dd_password_tips() {
-    warn false "
-This password is only used for SSH access to view logs during the installation.
-Password of the image will NOT modify.
+show_dd_tips() {
+    warn false '********** 提醒 Info **********'
+    warn false '用户名/密码/公钥仅用于安装时登录 SSH 查看日志/救砖，不会应用到新系统。'
+    warn false '镜像的用户名/密码/公钥不会被修改。'
+    warn false
+    warn false 'The Username/Password/Public Key is only for SSH login to view logs or rescue the system during installation, it will not be applied to the new system.'
+    warn false 'The Username/Password/Public Key inside the image will NOT be modified.'
+    warn false '**********************************'
+}
 
-密码仅用于安装过程中通过 SSH 查看日志。
-镜像的密码不会被修改。
-"
+show_fnos_tips() {
+    warn false '********** 提醒 Info **********'
+    warn false '用户名/密码/公钥仅用于安装时登录 SSH 查看日志/救砖，不会应用到新系统。'
+    warn false '安装完成后，你需要尽快到 http://IP:5666 配置账号密码。'
+    warn false '安装完成后，SSH 服务不会开启，你需要到 http://IP:5666 自行开启。'
+    warn false
+    warn false 'The Username/Password/Public Key is only for SSH login to view logs or rescue the system during installation, it will not be applied to the new system.'
+    warn false 'After installation, you need to config the username and password on http://IP:5666 as soon as possible.'
+    warn false 'After installation, SSH Service is disabled. You need to enable it from http://IP:5666.'
+    warn false '**********************************'
 }
 
 show_url_in_args() {
@@ -221,12 +233,12 @@ is_in_china() {
 
     if [ -z "$_loc" ]; then
         # www.cloudflare.com/dash.cloudflare.com 国内访问的是美国服务器，而且部分地区被墙
-        # 没有ipv6 www.visa.cn
-        # 没有ipv6 www.bose.cn
-        # 没有ipv6 www.garmin.com.cn
-        # 备用 www.prologis.cn
-        # 备用 www.autodesk.com.cn
-        # 备用 www.keysight.com.cn
+        # 以下这些都是用 cf cdn 且开通了国内 cdn 节点
+        # www.visa.com.cn
+        # www.garmin.com.cn
+        # www.prologis.cn
+        # www.autodesk.com.cn
+        # www.keysight.com.cn
         if ! _loc=$(curl -L http://www.qualcomm.cn/cdn-cgi/trace | grep '^loc=' | cut -d= -f2 | grep .); then
             error_and_exit "Can not get location."
         fi
@@ -726,6 +738,8 @@ is_cpu_supports_x86_64_v3() {
     # abm = popcnt + lzcnt
     # /proc/cpuinfo 不显示 lzcnt, 可用 abm 代替，但 cygwin 也不显示 abm
     # /proc/cpuinfo 不显示 osxsave, 故用 xsave 代替
+
+    # https://github.com/HenrikBengtsson/x86-64-level/blob/develop/x86-64-level
 
     # 在 32 位 cygwin 上也能正常识别
     need_flags="avx avx2 bmi1 bmi2 f16c fma movbe xsave"
@@ -1337,10 +1351,10 @@ get_best_windows_iso_line() {
             if [ -z "$latest_yyyymm" ] || [ "$yyyymm" -gt "$latest_yyyymm" ]; then
                 latest_yyyymm=$yyyymm
                 latest_updated_keyword=$_updated_xxx_20xx_
-                info "ISO Latest date"
-                echo "${latest_yyyymm:0:4}-${latest_yyyymm:4:2}" >&2
             fi
         done
+        info "ISO Latest date"
+        echo "${latest_yyyymm:0:4}-${latest_yyyymm:4:2}" >&2
         lines=$(grep -Fi "$latest_updated_keyword" <<<"$lines")
     fi
 
@@ -2607,16 +2621,19 @@ check_ram() {
     if is_in_windows; then
         ram_size=$(wmic memorychip get capacity | awk -F= '{sum+=$2} END {if(sum>0) print sum/1024/1024}')
     else
-        # lsmem最准确但 centos7 arm 和 alpine 不能用，debian 9 util-linux 没有 lsmem
+        # lsmem 最准确但 centos7 arm 和 archlinux arm 不能用，debian 9 util-linux 没有 lsmem
         # arm 24g dmidecode 显示少了128m
-        # arm 24g lshw 显示23BiB
+        # arm 24g lshw 显示 23GiB?
         # ec2 t4g arm alpine 用 lsmem 和 dmidecode 都无效，要用 lshw，但结果和free -m一致，其他平台则没问题
         install_pkg lsmem
         ram_size=$(lsmem -b 2>/dev/null | grep 'Total online memory:' | awk '{ print $NF/1024/1024 }')
 
         if ! is_valid_ram_size "$ram_size"; then
             install_pkg dmidecode
-            ram_size=$(dmidecode -t 17 | grep "Size.*[GM]B" | awk '{if ($3=="GB") s+=$2*1024; else s+=$2} END {if(s>0) print s}')
+            # centos 7 是 GB
+            # alpine 是 GiB
+            ram_size=$(dmidecode -t memory | grep -E "Size.*[GB|GiB|MiB|MB]" |
+                awk '{if ($3=="GB" || $3=="GiB") s+=$2*1024; else s+=$2} END {if(s>0) print s}')
         fi
 
         if ! is_valid_ram_size "$ram_size"; then
@@ -2782,6 +2799,7 @@ is_administrator_username() {
 }
 
 prompt_username() {
+    echo >&2
     info "prompt username"
 
     if [ "$distro" = windows ]; then
@@ -2790,8 +2808,9 @@ prompt_username() {
         default_username=root
     fi
 
-    warn false "Set username, leave blank to use $default_username"
     warn false "设置用户名，不填写则使用 $default_username"
+    warn false "Set username, leave blank will use $default_username"
+
     IFS= read -r -p "Username: " username
     username="$(printf "%s" "$username" | trim)"
 
@@ -2802,9 +2821,12 @@ prompt_username() {
 }
 
 prompt_password() {
+    echo >&2
     info "prompt password"
-    warn false "Set password, leave blank to use a random password."
+
     warn false "设置密码，不填写则使用随机密码"
+    warn false "Set password, leave blank will use a random password"
+
     while true; do
         IFS= read -r -p "Password: " password
         if [ -n "$password" ]; then
@@ -4441,6 +4463,11 @@ EOF
 done < <(cat "\$ROOT"/sys/class/tty/"\$1"/active | xargs -n 1)
 EOF
     fi
+
+    # 无法进入 alpine 时显示网络配置
+    insert_into_file init after 'Launching initramfs emergency recovery shell' -F <<EOF
+(cd /dev/netconf && grep -r . . >&2 || true)
+EOF
 }
 
 mod_initrd() {
@@ -5293,17 +5320,34 @@ done
 # 检查必须的参数
 verify_os_args
 
-# 用户名
-if ! is_netboot_xyz && [ -z "$username" ]; then
-    prompt_username
-fi
-
-# 密码
-if ! is_netboot_xyz && [ -z "$ssh_keys" ] && [ -z "$password" ]; then
-    if is_use_dd; then
-        show_dd_password_tips
+# 用户名密码
+if ! is_netboot_xyz; then
+    need_prompt_username=false
+    need_prompt_password=false
+    if [ -z "$username" ]; then
+        need_prompt_username=true
     fi
-    prompt_password
+    if [ -z "$password" ] && [ -z "$ssh_keys" ]; then
+        need_prompt_password=true
+    fi
+
+    # 提示
+    if $need_prompt_username || $need_prompt_password; then
+        case "$distro" in
+        dd) show_dd_tips ;;
+        fnos) show_fnos_tips ;;
+        esac
+    fi
+
+    # 用户名
+    if $need_prompt_username; then
+        prompt_username
+    fi
+
+    # 密码
+    if $need_prompt_password; then
+        prompt_password
+    fi
 fi
 
 # 强制忽略/强制添加 --ci 参数
@@ -5598,65 +5642,48 @@ elif [ "$distro" = alpine ] && [ "$hold" = 1 ]; then
     echo "SSH Port: $ssh_port"
 
 elif [ "$distro" = fnos ]; then
-    info "While Install (View Logs)"
-    echo "Username: $username"
+    echo "Username: $username (During installation only)"
     if [ -n "$ssh_keys" ]; then
-        echo "Public Key: $ssh_keys"
+        echo "Public Key: $ssh_keys (During installation only)"
     else
-        echo "Password: $password"
+        echo "Password: $password (During installation only)"
     fi
-    echo "SSH Port: $ssh_port"
-    echo "WEB: $(get_http_log_url)"
+    echo "SSH Port: $ssh_port (During installation only)"
+    echo "WEB: $(get_http_log_url) (During installation only)"
 
-    info "After Install"
-
-    echo "安装后不会开启 SSH 服务。"
-    echo "你需要尽快到 http://IP:5666 配置账号密码。"
     echo
-    echo "SSH Service is disabled after installation."
-    echo "You need to config the username and password on http://IP:5666 as soon as possible."
+    show_fnos_tips
 
 elif [ "$distro" = windows ]; then
-    info "While Install (View Logs)"
-    echo "Username: $username"
-    echo "Password: $password"
-    echo "SSH Port: $ssh_port"
-    echo "WEB: $(get_http_log_url)"
-
-    info "After Install"
     if is_administrator_username "$username"; then
-        echo "Username: $username (Depends on Windows iso's language)"
+        echo "Username: $username (Might vary on Windows, depends on system language)"
     else
         echo "Username: $username"
     fi
     echo "Password: $password"
     echo "RDP Port: $rdp_port"
+    echo "SSH Port: $ssh_port (During installation only)"
+    echo "WEB: $(get_http_log_url) (During installation only)"
 
 elif [ "$distro" = dd ]; then
-    info "While Install (View Logs)"
-    echo "Username: $username"
+    echo "Username: $username (During installation only)"
     if [ -n "$ssh_keys" ]; then
-        echo "Public Key: $ssh_keys"
+        echo "Public Key: $ssh_keys (During installation only)"
     else
-        echo "Password: $password"
+        echo "Password: $password (During installation only)"
     fi
-    echo "SSH Port: $ssh_port"
-    echo "WEB: $(get_http_log_url)"
+    echo "SSH Port: $ssh_port (During installation only)"
+    echo "WEB: $(get_http_log_url) (During installation only)"
 
-    info "After Install"
     if [ -n "$cloud_data" ]; then
         echo "Cloud Data: $cloud_data"
         echo "Cloud Data Files: $cloud_data_files"
     else
-        echo "Username: [Depends on image]"
-        echo "Public Key: [Depends on image]"
-        echo "Password: [Depends on image]"
-        echo "SSH Port: [Depends on image]"
+        echo
+        show_dd_tips
     fi
-
 else
     # 普通 linux
-    info "While Install (View Logs)"
     echo "Username: $username"
     if [ -n "$ssh_keys" ]; then
         echo "Public Key: $ssh_keys"
@@ -5664,16 +5691,7 @@ else
         echo "Password: $password"
     fi
     echo "SSH Port: $ssh_port"
-    echo "WEB: $(get_http_log_url)"
-
-    info "After Install"
-    echo "Username: $username"
-    if [ -n "$ssh_keys" ]; then
-        echo "Public Key: $ssh_keys"
-    else
-        echo "Password: $password"
-    fi
-    echo "SSH Port: $ssh_port"
+    echo "WEB: $(get_http_log_url) (During installation only)"
 fi
 
 if is_in_windows; then
@@ -5684,27 +5702,41 @@ fi
 
 echo
 if [ "$distro" = netboot.xyz ]; then
-    echo '重启后进入 netboot.xyz。'
-    echo "或者现在运行 \"$reinstall_____ reset\" 以清除该引导项。"
-    echo
-    echo 'Reboot to start netboot.xyz.'
-    echo "Or run \"$reinstall_____ reset\" now to clear this boot entry."
-    echo
+    warn false '********** 警告 Warning **********'
+    warn false '重启后会进入 netboot.xyz。'
+    warn false "如果要取消进入，请在重启前运行 \"$reinstall_____ reset\"。"
+    warn false
+    warn false 'Reboot will start netboot.xyz.'
+    warn false "If you want to cancel entering, run \"$reinstall_____ reset\" before reboot."
+    warn false '**********************************'
 
 elif [ "$distro" = alpine ] && [ "$hold" = 1 ]; then
-    echo '重启后进入 Alpine Live OS。'
-    echo "或者现在运行 \"$reinstall_____ reset\" 以清除该引导项。"
-    echo
-    echo 'Reboot to start Alpine Live OS.'
-    echo "Or run \"$reinstall_____ reset\" now to clear this boot entry."
-    echo
+    warn false '********** 警告 Warning **********'
+    warn false '重启后会进入 Alpine Live OS。'
+    warn false "如果要取消进入，请在重启前运行 \"$reinstall_____ reset\"。"
+    warn false
+    warn false 'Reboot will start Alpine Live OS.'
+    warn false "If you want to cancel entering, run \"$reinstall_____ reset\" before reboot."
+    warn false '**********************************'
+
+elif [ "$hold" = 1 ]; then
+    warn false '********** 警告 Warning **********'
+    warn false '重启后会进入安装环境，不会自动重装。'
+    warn false "如果要取消进入，请在重启前运行 \"$reinstall_____ reset\"。"
+    warn false
+    warn false 'Reboot will start the installation environment, will not automatically reinstall.'
+    warn false "If you want to cancel entering, run \"$reinstall_____ reset\" before reboot."
+    warn false '**********************************'
+
 else
-    warn false '警告：重装会清除主硬盘的所有数据，包括所有分区！'
-    echo '重启后开始重装。'
-    echo "或者现在运行 \"$reinstall_____ reset\" 以取消重装。"
-    echo
-    warn false 'Warning: Reinstalling will erase all data on the main disk, including all partitions!'
-    echo 'Reboot to start the reinstallation.'
-    echo "Or run \"$reinstall_____ reset\" now to cancel the reinstallation."
+    warn false '********** 警告 Warning **********'
+    warn false '重启后会自动开始重装。'
+    warn false '这将清除主硬盘的所有数据，包括所有分区！！！'
+    warn false "如果要取消重装，请在重启前运行 \"$reinstall_____ reset\"。"
+    warn false
+    warn false 'Reboot will start the automatic reinstallation.'
+    warn false 'THIS WILL ERASE ALL DATA ON THE MAIN DISK, INCLUDING ALL PARTITIONS!!!'
+    warn false "If you want to cancel the reinstallation, run \"$reinstall_____ reset\" before reboot."
+    warn false '**********************************'
 fi
 echo
