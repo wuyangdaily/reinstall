@@ -3720,7 +3720,18 @@ EOF
         bats="$bats windows-set-user-password-never-expires.bat"
     fi
 
-    # 6. frp
+    # 6. 禁止多次登录失败后锁定账户
+    # shellcheck disable=SC2154
+    if [ "$no_lockout_threshold" = 1 ]; then
+        cat <<EOF >$os_dir/windows-set-no-lockout-threshold.bat
+net accounts /lockoutthreshold:0
+del "%~f0"
+EOF
+        unix2dos $os_dir/windows-set-no-lockout-threshold.bat
+        bats="$bats windows-set-no-lockout-threshold.bat"
+    fi
+
+    # 7. frp
     if ls /configs/frpc.* >/dev/null 2>&1; then
         if [ "$(get_windows_arch_from_windows_drive "$os_dir" | to_lower)" = x86 ]; then
             os_bit=32
@@ -4107,19 +4118,6 @@ EOF
         create_network_manager_config /net.cfg "$os_dir"
         rm /net.cfg
 
-        # TODO: fedora 43 eol 后删除
-        # 删除 cloud-init 会删除依赖包 netcat
-        # 但是删除 netcat 时会报错
-        # 因此保留 netcat 包
-        # >>> Running %preun scriptlet: netcat-0:1.229-3.fc43.x86_64
-        # >>> Error in %preun scriptlet: netcat-0:1.229-3.fc43.x86_64
-        # >>> Scriptlet output:
-        # >>> failed to create admindir: No such file or directory
-        # >>> [RPM] %preun(netcat-1.229-3.fc43.x86_64) scriptlet failed, exit status 2
-        # >>> [RPM] netcat-1.229-3.fc43.x86_64: erase failed
-        if [ "$distro" = fedora ] && [ "$releasever" = 43 ]; then
-            chroot $os_dir dnf mark user netcat -y
-        fi
         remove_or_disable_cloud_init $os_dir
 
         disable_selinux $os_dir
